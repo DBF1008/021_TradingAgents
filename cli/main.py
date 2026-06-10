@@ -84,6 +84,7 @@ class MessageBuffer:
         self.report_sections = {}
         self.selected_analysts = []
         self._processed_message_ids = set()
+        self.verified_market_data = None
 
     def init_for_analysis(self, selected_analysts):
         """Initialize agent status and report sections based on selected analysts.
@@ -116,6 +117,7 @@ class MessageBuffer:
         self.current_report = None
         self.final_report = None
         self.current_agent = None
+        self.verified_market_data = None
         self.messages.clear()
         self.tool_calls.clear()
         self._processed_message_ids.clear()
@@ -190,6 +192,10 @@ class MessageBuffer:
 
     def _update_final_report(self):
         report_parts = []
+
+        # Verified Market Data (audit trail)
+        if self.verified_market_data:
+            report_parts.append("## Verified Market Data\n" + self.verified_market_data)
 
         # Analyst Team Reports - use .get() to handle missing sections
         analyst_sections = ["market_report", "sentiment_report", "news_report", "fundamentals_report"]
@@ -700,6 +706,17 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     save_path.mkdir(parents=True, exist_ok=True)
     sections = []
 
+    # 0. Verified Market Data (audit trail)
+    if final_state.get("verified_market_data"):
+        verified_dir = save_path / "0_verified_data"
+        verified_dir.mkdir(exist_ok=True)
+        (verified_dir / "market_snapshot.md").write_text(
+            final_state["verified_market_data"], encoding="utf-8"
+        )
+        sections.append(
+            f"## 0. Verified Market Data\n\n{final_state['verified_market_data']}"
+        )
+
     # 1. Analysts
     analysts_dir = save_path / "1_analysts"
     analyst_parts = []
@@ -789,6 +806,16 @@ def display_complete_report(final_state):
     """Display the complete analysis report sequentially (avoids truncation)."""
     console.print()
     console.print(Rule("Complete Analysis Report", style="bold green"))
+
+    # 0. Verified Market Data (audit trail)
+    if final_state.get("verified_market_data"):
+        console.print(Panel("[bold]0. Verified Market Data[/bold]", border_style="bright_white"))
+        console.print(Panel(
+            Markdown(final_state["verified_market_data"]),
+            title="Deterministic Price Snapshot",
+            border_style="bright_white",
+            padding=(1, 2),
+        ))
 
     # I. Analyst Team Reports
     analysts = []
@@ -1158,6 +1185,10 @@ def run_analysis(checkpoint: bool = False):
                 chunk,
                 wall_time_tracker=analyst_wall_time_tracker,
             )
+
+            # Capture verified market data snapshot for audit trail
+            if chunk.get("verified_market_data"):
+                message_buffer.verified_market_data = chunk["verified_market_data"]
 
             # Research Team - Handle Investment Debate State
             if chunk.get("investment_debate_state"):

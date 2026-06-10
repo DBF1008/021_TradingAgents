@@ -1,3 +1,5 @@
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
@@ -7,6 +9,9 @@ from tradingagents.agents.utils.agent_utils import (
     get_verified_market_snapshot,
 )
 from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.market_data_validator import build_verified_market_snapshot
+
+logger = logging.getLogger(__name__)
 
 
 def create_market_analyst(llm):
@@ -82,13 +87,32 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
         result = chain.invoke(state["messages"])
 
         report = ""
+        verified_snapshot = ""
 
         if len(result.tool_calls) == 0:
             report = result.content
+            ticker = state["company_of_interest"]
+            try:
+                verified_snapshot = build_verified_market_snapshot(
+                    ticker, current_date
+                )
+            except ValueError:
+                logger.warning(
+                    "No OHLCV data for %s on or before %s; "
+                    "verified snapshot unavailable.",
+                    ticker, current_date,
+                )
+                verified_snapshot = (
+                    f"## Verified market data snapshot for {ticker.upper()}\n\n"
+                    f"No OHLCV data available on or before {current_date}. "
+                    "The market analyst report above could not be cross-referenced "
+                    "against a deterministic price snapshot."
+                )
 
         return {
             "messages": [result],
             "market_report": report,
+            "verified_market_data": verified_snapshot,
         }
 
     return market_analyst_node
