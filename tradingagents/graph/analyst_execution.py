@@ -17,6 +17,17 @@ class AnalystExecutionPlan:
     specs: List[AnalystNodeSpec]
     concurrency_limit: int
 
+    def partitions(self) -> List[List["AnalystNodeSpec"]]:
+        """Split specs into sequential waves of at most *concurrency_limit* members.
+
+        Within a wave analysts execute in parallel; waves run in sequence.
+        """
+        limit = min(self.concurrency_limit, len(self.specs))
+        return [
+            self.specs[i : i + limit]
+            for i in range(0, len(self.specs), limit)
+        ]
+
 
 ANALYST_NODE_SPECS: Dict[str, AnalystNodeSpec] = {
     "market": AnalystNodeSpec(
@@ -78,6 +89,11 @@ def get_initial_analyst_node(plan: AnalystExecutionPlan) -> str:
     return plan.specs[0].agent_node
 
 
+def get_initial_analyst_keys(plan: AnalystExecutionPlan) -> List[str]:
+    """Return the keys of all analysts in the first wave (partition 0)."""
+    return [spec.key for spec in plan.partitions()[0]]
+
+
 class AnalystWallTimeTracker:
     def __init__(self, plan: AnalystExecutionPlan):
         self.plan = plan
@@ -124,17 +140,31 @@ def sync_analyst_tracker_from_chunk(
     chunk: Dict[str, str],
     now: Optional[float] = None,
 ) -> None:
+    """Synchronize wall-time tracker from streaming chunk state.
+
+    Walks partitions (waves) in order:
+    - Completed wave: mark all members started+completed.
+    - Active wave (first wave with any member lacking a report):
+      mark completed members done, mark remaining as started.
+    - Future waves: leave untouched.
+    """
     current_time = monotonic() if now is None else now
-    active_found = False
 
-    for spec in tracker.plan.specs:
-        has_report = bool(chunk.get(spec.report_key))
+    for partition in tracker.plan.partitions():
+        wave_complete = True
+        for spec in partition:
+            has_report = bool(chunk.get(spec.report_key))
+            if has_report:
+                tracker.mark_started(spec.key, started_at=current_time)
+                tracker.mark_completed(spec.key, completed_at=current_time)
+            else:
+                wave_complete = False
 
-        if has_report:
-            tracker.mark_started(spec.key, started_at=current_time)
-            tracker.mark_completed(spec.key, completed_at=current_time)
+        if wave_complete:
             continue
 
-        if not active_found:
-            tracker.mark_started(spec.key, started_at=current_time)
-            active_found = True
+        # Active wave — mark remaining members as started
+        for spec in partition:
+            if not bool(chunk.get(spec.report_key)):
+                tracker.mark_started(spec.key, started_at=current_time)
+        break

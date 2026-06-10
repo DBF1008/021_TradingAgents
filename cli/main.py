@@ -25,7 +25,7 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
-    get_initial_analyst_node,
+    get_initial_analyst_keys,
     sync_analyst_tracker_from_chunk,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -869,47 +869,63 @@ ANALYST_REPORT_MAP = {
 }
 
 
-def update_analyst_statuses(message_buffer, chunk, wall_time_tracker=None):
+def update_analyst_statuses(message_buffer, chunk, plan=None, wall_time_tracker=None):
     """Update analyst statuses based on accumulated report state.
 
-    Logic:
-    - Store new report content from the current chunk if present
-    - Check accumulated report_sections (not just current chunk) for status
-    - Analysts with reports = completed
-    - First analyst without report = in_progress
-    - Remaining analysts without reports = pending
-    - When all analysts done, set Bull Researcher to in_progress
+    When *plan* is provided, uses its partitions to determine which analysts
+    are concurrent.  When *plan* is None, falls back to serial (one-at-a-time)
+    behavior for backward compatibility.
     """
     selected = message_buffer.selected_analysts
-    found_active = False
 
     if wall_time_tracker is not None:
         sync_analyst_tracker_from_chunk(wall_time_tracker, chunk)
 
+    # Capture new report content from current chunk
     for analyst_key in ANALYST_ORDER:
         if analyst_key not in selected:
             continue
-
-        agent_name = ANALYST_AGENT_NAMES[analyst_key]
         report_key = ANALYST_REPORT_MAP[analyst_key]
-
-        # Capture new report content from current chunk
         if chunk.get(report_key):
             message_buffer.update_report_section(report_key, chunk[report_key])
 
-        # Determine status from accumulated sections, not just current chunk
-        has_report = bool(message_buffer.report_sections.get(report_key))
+    # Build partition keys from plan, filtering to selected analysts
+    if plan is not None:
+        partition_keys = [
+            [spec.key for spec in p if spec.key in selected]
+            for p in plan.partitions()
+        ]
+        partition_keys = [p for p in partition_keys if p]
+    else:
+        partition_keys = [[k] for k in ANALYST_ORDER if k in selected]
 
-        if has_report:
-            message_buffer.update_agent_status(agent_name, "completed")
-        elif not found_active:
-            message_buffer.update_agent_status(agent_name, "in_progress")
-            found_active = True
-        else:
-            message_buffer.update_agent_status(agent_name, "pending")
+    found_active_wave = False
+    for partition in partition_keys:
+        if found_active_wave:
+            for key in partition:
+                message_buffer.update_agent_status(ANALYST_AGENT_NAMES[key], "pending")
+            continue
+
+        wave_complete = True
+        for key in partition:
+            report_key = ANALYST_REPORT_MAP[key]
+            has_report = bool(message_buffer.report_sections.get(report_key))
+            if has_report:
+                message_buffer.update_agent_status(ANALYST_AGENT_NAMES[key], "completed")
+            else:
+                wave_complete = False
+
+        if wave_complete:
+            continue
+
+        found_active_wave = True
+        for key in partition:
+            report_key = ANALYST_REPORT_MAP[key]
+            if not bool(message_buffer.report_sections.get(report_key)):
+                message_buffer.update_agent_status(ANALYST_AGENT_NAMES[key], "in_progress")
 
     # When all analysts complete, transition research team to in_progress
-    if not found_active and selected:
+    if not found_active_wave and selected:
         if message_buffer.agent_status.get("Bull Researcher") == "pending":
             message_buffer.update_agent_status("Bull Researcher", "in_progress")
 
@@ -1101,10 +1117,11 @@ def run_analysis(checkpoint: bool = False):
         )
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
-        # Update agent status to in_progress for the first analyst
-        first_analyst = get_initial_analyst_node(analyst_execution_plan)
-        message_buffer.update_agent_status(first_analyst, "in_progress")
-        analyst_wall_time_tracker.mark_started(selected_analyst_keys[0])
+        # Update agent status to in_progress for the first wave of analysts
+        for key in get_initial_analyst_keys(analyst_execution_plan):
+            agent_name = ANALYST_AGENT_NAMES.get(key, key)
+            message_buffer.update_agent_status(agent_name, "in_progress")
+            analyst_wall_time_tracker.mark_started(key)
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
         # Create spinner text
@@ -1156,6 +1173,7 @@ def run_analysis(checkpoint: bool = False):
             update_analyst_statuses(
                 message_buffer,
                 chunk,
+                plan=analyst_execution_plan,
                 wall_time_tracker=analyst_wall_time_tracker,
             )
 
