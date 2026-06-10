@@ -130,6 +130,45 @@ class TestTradingMemoryLogCore:
         log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         assert len(log.load_entries()) == 1
 
+    # Regression: store_decision must deduplicate against resolved entries too
+
+    def test_store_after_resolve_replaces_entry(self, tmp_path):
+        """Re-running the same ticker+date after resolve replaces the old entry."""
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.update_with_outcome("NVDA", "2026-01-10", 0.05, 0.02, 5, "Correct.")
+        # Simulate a re-run for the same ticker+date
+        log.store_decision("NVDA", "2026-01-10", DECISION_SELL)
+        entries = log.load_entries()
+        assert len(entries) == 1, f"expected 1 entry, got {len(entries)}"
+        assert entries[0]["pending"] is True
+        assert entries[0]["rating"] == "Sell"
+
+    def test_store_after_resolve_preserves_other_entries(self, tmp_path):
+        """Replacing a resolved entry must not affect other tickers or dates."""
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.store_decision("AAPL", "2026-01-11", DECISION_OVERWEIGHT)
+        log.update_with_outcome("NVDA", "2026-01-10", 0.05, 0.02, 5, "Correct.")
+        # Replace the resolved NVDA entry
+        log.store_decision("NVDA", "2026-01-10", DECISION_SELL)
+        entries = log.load_entries()
+        assert len(entries) == 2
+        tickers = {e["ticker"]: e for e in entries}
+        assert tickers["AAPL"]["pending"] is True
+        assert tickers["AAPL"]["rating"] == "Overweight"
+        assert tickers["NVDA"]["pending"] is True
+        assert tickers["NVDA"]["rating"] == "Sell"
+
+    def test_store_after_resolve_idempotent_on_pending(self, tmp_path):
+        """After replacing a resolved entry, a second store_decision is a no-op."""
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.update_with_outcome("NVDA", "2026-01-10", 0.05, 0.02, 5, "Correct.")
+        log.store_decision("NVDA", "2026-01-10", DECISION_SELL)
+        log.store_decision("NVDA", "2026-01-10", DECISION_SELL)
+        assert len(log.load_entries()) == 1
+
     def test_batch_update_resolves_multiple_entries(self, tmp_path):
         """batch_update_with_outcomes resolves multiple pending entries in one write."""
         log = make_log(tmp_path)

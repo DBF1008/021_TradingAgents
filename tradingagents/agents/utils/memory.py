@@ -34,15 +34,26 @@ class TradingMemoryLog:
         trade_date: str,
         final_trade_decision: str,
     ) -> None:
-        """Append pending entry at end of propagate(). No LLM call."""
+        """Append pending entry at end of propagate(). No LLM call.
+
+        Guarantees at most one entry per (ticker, trade_date):
+        - If a pending entry already exists → no-op (idempotent).
+        - If a resolved entry already exists (from a prior run) → remove it
+          first so the new decision replaces it.
+        """
         if not self._log_path:
             return
-        # Idempotency guard: fast raw-text scan instead of full parse
+        prefix = f"[{trade_date} | {ticker} |"
         if self._log_path.exists():
             raw = self._log_path.read_text(encoding="utf-8")
             for line in raw.splitlines():
-                if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
-                    return
+                if line.startswith(prefix):
+                    if line.endswith("| pending]"):
+                        return  # idempotent: pending entry already present
+                    # Resolved entry for same ticker+date — evict it so the
+                    # new run replaces it with a fresh pending entry.
+                    self._remove_entries(trade_date, ticker)
+                    break
         rating = parse_rating(final_trade_decision)
         tag = f"[{trade_date} | {ticker} | {rating} | pending]"
         entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
@@ -217,6 +228,23 @@ class TradingMemoryLog:
         tmp_path.replace(self._log_path)
 
     # --- Helpers ---
+
+    def _remove_entries(self, trade_date: str, ticker: str) -> None:
+        """Remove all entries matching (trade_date, ticker) via atomic rewrite."""
+        if not self._log_path or not self._log_path.exists():
+            return
+        text = self._log_path.read_text(encoding="utf-8")
+        prefix = f"[{trade_date} | {ticker} |"
+        blocks = text.split(self._SEPARATOR)
+        new_blocks = [
+            block for block in blocks
+            if not block.strip()
+            or not block.strip().splitlines()[0].strip().startswith(prefix)
+        ]
+        new_text = self._SEPARATOR.join(new_blocks)
+        tmp_path = self._log_path.with_suffix(".tmp")
+        tmp_path.write_text(new_text, encoding="utf-8")
+        tmp_path.replace(self._log_path)
 
     def _apply_rotation(self, blocks: List[str]) -> List[str]:
         """Drop oldest resolved blocks when their count exceeds max_entries.

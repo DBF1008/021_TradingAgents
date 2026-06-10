@@ -340,9 +340,33 @@ class TradingAgentsGraph:
                 self.config["data_cache_dir"], company_name, str(trade_date)
             )
             if step is not None:
-                logger.info(
-                    "Resuming from step %d for %s on %s", step, company_name, trade_date
+                # Guard against stale checkpoints: if the result JSON already
+                # exists, the previous run actually completed but the checkpoint
+                # was not cleaned (e.g. crash between _log_state and
+                # clear_checkpoint in an older version).  Clear the stale
+                # checkpoint so the graph starts fresh instead of replaying a
+                # finished run.
+                safe_ticker = safe_ticker_component(company_name)
+                log_path = (
+                    Path(self.config["results_dir"])
+                    / safe_ticker
+                    / "TradingAgentsStrategy_logs"
+                    / f"full_states_log_{trade_date}.json"
                 )
+                if log_path.exists():
+                    logger.info(
+                        "Stale checkpoint detected for %s on %s "
+                        "(result already exists); clearing",
+                        company_name, trade_date,
+                    )
+                    clear_checkpoint(
+                        self.config["data_cache_dir"], company_name, str(trade_date)
+                    )
+                else:
+                    logger.info(
+                        "Resuming from step %d for %s on %s",
+                        step, company_name, trade_date,
+                    )
             else:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
@@ -396,18 +420,20 @@ class TradingAgentsGraph:
         # Log state to disk.
         self._log_state(trade_date, final_state)
 
+        # Clear checkpoint BEFORE store_decision so a crash between the two
+        # cannot leave a stale checkpoint that tricks the next run into
+        # resuming an already-completed analysis.
+        if self.config.get("checkpoint_enabled"):
+            clear_checkpoint(
+                self.config["data_cache_dir"], company_name, str(trade_date)
+            )
+
         # Store decision for deferred reflection on the next same-ticker run.
         self.memory_log.store_decision(
             ticker=company_name,
             trade_date=trade_date,
             final_trade_decision=final_state["final_trade_decision"],
         )
-
-        # Clear checkpoint on successful completion to avoid stale state.
-        if self.config.get("checkpoint_enabled"):
-            clear_checkpoint(
-                self.config["data_cache_dir"], company_name, str(trade_date)
-            )
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
 

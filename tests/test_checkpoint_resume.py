@@ -1,10 +1,13 @@
 """Test checkpoint resume: crash mid-analysis, re-run resumes from last node."""
 
+import functools
+import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from typing import TypedDict
+from unittest.mock import MagicMock, patch, call
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
@@ -16,6 +19,8 @@ from tradingagents.graph.checkpointer import (
     has_checkpoint,
     thread_id,
 )
+from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 # Mutable flag to simulate crash on first run
 _should_crash = False
@@ -145,3 +150,219 @@ class TestCheckpointResume(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Regression: checkpoint stability after resume fixes
+# ---------------------------------------------------------------------------
+
+def _fake_state():
+    """Minimal final state dict for _run_graph."""
+    return {
+        "final_trade_decision": "Rating: Buy\nBuy NVDA.",
+        "company_of_interest": "NVDA",
+        "trade_date": "2026-04-20",
+        "market_report": "",
+        "sentiment_report": "",
+        "news_report": "",
+        "fundamentals_report": "",
+        "investment_debate_state": {
+            "bull_history": "", "bear_history": "", "history": "",
+            "current_response": "", "judge_decision": "",
+        },
+        "investment_plan": "",
+        "trader_investment_plan": "",
+        "risk_debate_state": {
+            "aggressive_history": "", "conservative_history": "",
+            "neutral_history": "", "history": "", "judge_decision": "",
+            "current_aggressive_response": "", "current_conservative_response": "",
+            "current_neutral_response": "", "count": 1, "latest_speaker": "",
+        },
+    }
+
+
+def _mock_graph(tmp_path, checkpoint_enabled=True):
+    """Build a MagicMock TradingAgentsGraph with real memory log and paths."""
+    g = MagicMock(spec=TradingAgentsGraph)
+    g.memory_log = TradingMemoryLog({"memory_log_path": str(tmp_path / "mem.md")})
+    g.log_states_dict = {}
+    g.debug = False
+    g.ticker = "NVDA"
+    g.config = {
+        "data_cache_dir": str(tmp_path / "cache"),
+        "results_dir": str(tmp_path / "results"),
+        "checkpoint_enabled": checkpoint_enabled,
+    }
+    g.graph = MagicMock()
+    g.graph.invoke.return_value = _fake_state()
+    g.propagator = MagicMock()
+    g.propagator.create_initial_state.return_value = _fake_state()
+    g.propagator.get_graph_args.return_value = {}
+    g.signal_processor = MagicMock()
+    g.signal_processor.process_signal.return_value = "Buy"
+    return g
+
+
+class TestCheckpointStability:
+    """Regression tests for the three checkpoint resume bugs."""
+
+    def test_clear_checkpoint_before_store_decision(self, tmp_path):
+        """clear_checkpoint must execute BEFORE store_decision in _run_graph
+        so a crash between them cannot leave a stale checkpoint."""
+        g = _mock_graph(tmp_path, checkpoint_enabled=True)
+
+        call_order = []
+        original_store = g.memory_log.store_decision
+
+        def tracked_store(*a, **kw):
+            call_order.append("store_decision")
+            return original_store(*a, **kw)
+
+        g.memory_log.store_decision = tracked_store
+
+        with patch(
+            "tradingagents.graph.trading_graph.clear_checkpoint"
+        ) as mock_clear:
+            mock_clear.side_effect = lambda *a, **kw: call_order.append("clear_checkpoint")
+
+            g._run_graph = functools.partial(TradingAgentsGraph._run_graph, g)
+            g._run_graph("NVDA", "2026-04-20")
+
+        assert "clear_checkpoint" in call_order
+        assert "store_decision" in call_order
+        assert call_order.index("clear_checkpoint") < call_order.index("store_decision"), \
+            f"clear_checkpoint must run before store_decision, got: {call_order}"
+
+    def test_stale_checkpoint_cleared_when_result_exists(self, tmp_path):
+        """If a checkpoint exists but the JSON result log is already on disk,
+        propagate() must clear the stale checkpoint instead of resuming."""
+        ticker = "NVDA"
+        date = "2026-04-20"
+        data_dir = str(tmp_path / "cache")
+        results_dir = str(tmp_path / "results")
+
+        # 1. Create a checkpoint
+        tid = thread_id(ticker, date)
+        with get_checkpointer(data_dir, ticker) as saver:
+            builder = StateGraph(_SimpleState)
+            builder.add_node("a", _node_a)
+            builder.set_entry_point("a")
+            builder.add_edge("a", END)
+            graph = builder.compile(checkpointer=saver)
+            graph.invoke({"count": 0}, config={"configurable": {"thread_id": tid}})
+
+        assert has_checkpoint(data_dir, ticker, date)
+
+        # 2. Create the JSON result log (simulating a completed run)
+        log_dir = Path(results_dir) / ticker / "TradingAgentsStrategy_logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / f"full_states_log_{date}.json").write_text("{}", encoding="utf-8")
+
+        # 3. Call propagate — it should detect and clear the stale checkpoint
+        g = _mock_graph(tmp_path, checkpoint_enabled=True)
+        g.config["data_cache_dir"] = data_dir
+        g.config["results_dir"] = results_dir
+        g.workflow = MagicMock()
+        g._checkpointer_ctx = None
+        g._resolve_pending_entries = MagicMock()
+        g._run_graph = MagicMock(return_value=(_fake_state(), "Buy"))
+
+        with patch("tradingagents.graph.trading_graph.get_checkpointer") as mock_cp, \
+             patch("tradingagents.graph.trading_graph.checkpoint_step") as mock_step, \
+             patch("tradingagents.graph.trading_graph.clear_checkpoint") as mock_clear:
+            mock_cp.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_cp.return_value.__exit__ = MagicMock(return_value=False)
+            mock_step.return_value = 3  # pretend step 3 exists
+
+            TradingAgentsGraph.propagate(g, ticker, date)
+
+            mock_clear.assert_called_once_with(data_dir, ticker, date)
+
+    def test_genuine_crash_resumes_not_cleared(self, tmp_path):
+        """A checkpoint without a result JSON must NOT be cleared — the run
+        genuinely crashed and should resume."""
+        ticker = "NVDA"
+        date = "2026-04-20"
+        data_dir = str(tmp_path / "cache")
+        results_dir = str(tmp_path / "results")
+
+        # No JSON result log on disk — this is a genuine incomplete run.
+
+        g = _mock_graph(tmp_path, checkpoint_enabled=True)
+        g.config["data_cache_dir"] = data_dir
+        g.config["results_dir"] = results_dir
+        g.workflow = MagicMock()
+        g._checkpointer_ctx = None
+        g._resolve_pending_entries = MagicMock()
+        g._run_graph = MagicMock(return_value=(_fake_state(), "Buy"))
+
+        with patch("tradingagents.graph.trading_graph.get_checkpointer") as mock_cp, \
+             patch("tradingagents.graph.trading_graph.checkpoint_step") as mock_step, \
+             patch("tradingagents.graph.trading_graph.clear_checkpoint") as mock_clear:
+            mock_cp.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_cp.return_value.__exit__ = MagicMock(return_value=False)
+            mock_step.return_value = 2  # genuine in-progress checkpoint
+
+            TradingAgentsGraph.propagate(g, ticker, date)
+
+            # clear_checkpoint must NOT be called during propagate — the
+            # checkpoint is valid and the graph should resume from it.
+            mock_clear.assert_not_called()
+
+    def test_successful_run_leaves_no_checkpoint(self, tmp_path):
+        """After a successful _run_graph with checkpoint_enabled, no
+        checkpoint remains for that ticker+date."""
+        g = _mock_graph(tmp_path, checkpoint_enabled=True)
+        data_dir = g.config["data_cache_dir"]
+        ticker = "NVDA"
+        date = "2026-04-20"
+
+        # Seed a checkpoint so clear_checkpoint has something to work on
+        tid = thread_id(ticker, date)
+        with get_checkpointer(data_dir, ticker) as saver:
+            builder = StateGraph(_SimpleState)
+            builder.add_node("a", _node_a)
+            builder.set_entry_point("a")
+            builder.add_edge("a", END)
+            graph = builder.compile(checkpointer=saver)
+            graph.invoke({"count": 0}, config={"configurable": {"thread_id": tid}})
+
+        assert has_checkpoint(data_dir, ticker, date)
+
+        # Run _run_graph — it should clear the checkpoint
+        g._run_graph = functools.partial(TradingAgentsGraph._run_graph, g)
+        g._run_graph(ticker, date)
+
+        assert not has_checkpoint(data_dir, ticker, date)
+
+    def test_no_duplicate_memory_entries_across_crash_resume_cycle(self, tmp_path):
+        """Full crash-resume cycle must not produce duplicate memory log entries.
+
+        Scenario: run completes → decision stored → checkpoint cleared.
+        Next run for same ticker+date (user intentionally re-runs): resolved
+        entry is replaced, not duplicated.
+        """
+        g = _mock_graph(tmp_path, checkpoint_enabled=False)
+        g._run_graph = functools.partial(TradingAgentsGraph._run_graph, g)
+
+        # First run
+        g._run_graph("NVDA", "2026-04-20")
+        entries = g.memory_log.load_entries()
+        assert len(entries) == 1
+        assert entries[0]["pending"] is True
+
+        # Resolve the pending entry (simulating _resolve_pending_entries on next run)
+        g.memory_log.update_with_outcome(
+            "NVDA", "2026-04-20", 0.05, 0.02, 5, "Correct."
+        )
+        entries = g.memory_log.load_entries()
+        assert len(entries) == 1
+        assert entries[0]["pending"] is False
+
+        # Second run — same ticker+date
+        g._run_graph("NVDA", "2026-04-20")
+        entries = g.memory_log.load_entries()
+        assert len(entries) == 1, (
+            f"expected exactly 1 entry after re-run, got {len(entries)}"
+        )
+        assert entries[0]["pending"] is True
