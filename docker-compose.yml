@@ -12,6 +12,11 @@ services:
     image: ollama/ollama:latest
     volumes:
       - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
     profiles:
       - ollama
 
@@ -20,11 +25,15 @@ services:
     env_file:
       - .env
     environment:
-      - LLM_PROVIDER=ollama
+      - TRADINGAGENTS_LLM_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
+      - TRADINGAGENTS_DEEP_THINK_LLM=qwen3:latest
+      - TRADINGAGENTS_QUICK_THINK_LLM=qwen3:latest
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
     depends_on:
-      - ollama
+      ollama:
+        condition: service_healthy
     tty: true
     stdin_open: true
     profiles:

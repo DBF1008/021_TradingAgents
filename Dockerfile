@@ -8,7 +8,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
 COPY . .
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . \
+ && python -c "from tradingagents.default_config import DEFAULT_CONFIG; print('build-ok')"
 
 FROM python:3.12-slim
 
