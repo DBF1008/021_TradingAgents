@@ -6,7 +6,7 @@ import functools
 
 from langchain_core.messages import AIMessage
 
-from tradingagents.agents.schemas import TraderProposal, render_trader_proposal
+from tradingagents.agents.schemas import TraderProposal, render_trader_proposal, recover_trader_proposal
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
@@ -54,6 +54,8 @@ def create_trader(llm):
             messages,
             render_trader_proposal,
             "Trader",
+            schema=TraderProposal,
+            recover=recover_trader_proposal,
         )
 
         return {

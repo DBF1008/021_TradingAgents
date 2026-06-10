@@ -10,7 +10,7 @@ back gracefully to free-text generation.
 
 from __future__ import annotations
 
-from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision, recover_pm_decision
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
@@ -69,6 +69,8 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
             prompt,
             render_pm_decision,
             "Portfolio Manager",
+            schema=PortfolioDecision,
+            recover=recover_pm_decision,
         )
 
         new_risk_debate_state = {

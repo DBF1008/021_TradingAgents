@@ -18,10 +18,13 @@ so that:
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from tradingagents.agents.utils.rating import parse_rating
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +318,204 @@ def render_sentiment_report(report: SentimentReport) -> str:
         "",
         report.narrative,
     ])
+
+
+# ---------------------------------------------------------------------------
+# Heuristic recovery from free-text (Tier 3 of the degradation chain)
+# ---------------------------------------------------------------------------
+#
+# Each ``recover_*`` function mirrors the corresponding ``render_*``:
+# it attempts to reconstruct a typed Pydantic instance from prose that
+# *should* contain the same section headers but may have drifted in
+# formatting.  Returns ``None`` when the text is too unstructured to
+# salvage, letting the caller fall through to Tier 4 (raw text).
+# ---------------------------------------------------------------------------
+
+# -- shared helpers --
+
+# Matches a section that starts with an optional-bold header label followed
+# by a colon, and runs until the next bold header or end of text.
+_SECTION_RE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _extract_section(text: str, header: str) -> Optional[str]:
+    """Extract the content following a ``**Header**: …`` label.
+
+    Tolerates optional markdown bold, colon or full-width colon, and
+    captures everything up to the next ``**…**:`` header or end-of-text.
+    """
+    if header not in _SECTION_RE_CACHE:
+        _SECTION_RE_CACHE[header] = re.compile(
+            rf"\*{{0,2}}{re.escape(header)}\*{{0,2}}"  # optional bold
+            rf"\s*[:：]\s*"                              # colon separator
+            rf"(.*?)"                                    # content (lazy)
+            rf"(?=\n\s*\*\*\w|\nFINAL TRANSACTION|\Z)",  # next header or EOF
+            re.DOTALL | re.IGNORECASE,
+        )
+    m = _SECTION_RE_CACHE[header].search(text)
+    if m:
+        val = m.group(1).strip()
+        return val if val else None
+    return None
+
+
+# Lines that look like bold-header metadata or the FINAL TRANSACTION marker.
+_META_LINE_RE = re.compile(
+    r"^\s*(?:\*\*\w.*?[:：]|FINAL TRANSACTION PROPOSAL)", re.IGNORECASE,
+)
+
+
+def _body_text(text: str) -> str:
+    """Return *text* with bold-header lines and marker lines stripped.
+
+    Used as a last-resort fallback for text fields (e.g. ``reasoning``)
+    when ``_extract_section`` cannot find a matching header.  Stripping
+    metadata lines prevents the ``render_*`` functions from producing
+    duplicate headers in the final output.
+    """
+    body = []
+    for line in text.splitlines():
+        if _META_LINE_RE.match(line):
+            continue
+        body.append(line)
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(body)).strip()
+    return result
+
+
+_PORTFOLIO_RATING_MAP = {r.value.lower(): r for r in PortfolioRating}
+_TRADER_ACTION_MAP = {a.value.lower(): a for a in TraderAction}
+_SENTIMENT_BAND_MAP = {b.value.lower(): b for b in SentimentBand}
+
+_ACTION_LABEL_RE = re.compile(
+    r"(?:action|final\s+transaction\s+proposal)\*{0,2}\s*[:：]\s*\*{0,2}\s*(\w+)",
+    re.IGNORECASE,
+)
+_SCORE_RE = re.compile(
+    r"(?:score)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*/\s*10",
+    re.IGNORECASE,
+)
+_CONFIDENCE_RE = re.compile(
+    r"confidence\s*[:：]?\s*\*{0,2}\s*(low|medium|high)",
+    re.IGNORECASE,
+)
+_FLOAT_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+# -- per-schema recovery functions --
+
+
+def recover_research_plan(text: str) -> Optional[ResearchPlan]:
+    """Heuristically reconstruct a ResearchPlan from free-text prose."""
+    rating_str = parse_rating(text, default="")
+    if not rating_str:
+        return None
+    rating = _PORTFOLIO_RATING_MAP.get(rating_str.lower())
+    if rating is None:
+        return None
+
+    rationale = _extract_section(text, "Rationale") or _body_text(text)
+    strategic_actions = _extract_section(text, "Strategic Actions") or ""
+
+    return ResearchPlan(
+        recommendation=rating,
+        rationale=rationale,
+        strategic_actions=strategic_actions,
+    )
+
+
+def recover_trader_proposal(text: str) -> Optional[TraderProposal]:
+    """Heuristically reconstruct a TraderProposal from free-text prose."""
+    action = None
+    m = _ACTION_LABEL_RE.search(text)
+    if m:
+        action = _TRADER_ACTION_MAP.get(m.group(1).strip().lower())
+    if action is None:
+        return None
+
+    reasoning = _extract_section(text, "Reasoning") or _body_text(text)
+
+    entry_price = None
+    ep_str = _extract_section(text, "Entry Price")
+    if ep_str:
+        fm = _FLOAT_RE.search(ep_str)
+        if fm:
+            entry_price = float(fm.group(1))
+
+    stop_loss = None
+    sl_str = _extract_section(text, "Stop Loss")
+    if sl_str:
+        fm = _FLOAT_RE.search(sl_str)
+        if fm:
+            stop_loss = float(fm.group(1))
+
+    position_sizing = _extract_section(text, "Position Sizing")
+
+    return TraderProposal(
+        action=action,
+        reasoning=reasoning,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        position_sizing=position_sizing,
+    )
+
+
+def recover_pm_decision(text: str) -> Optional[PortfolioDecision]:
+    """Heuristically reconstruct a PortfolioDecision from free-text prose."""
+    rating_str = parse_rating(text, default="")
+    if not rating_str:
+        return None
+    rating = _PORTFOLIO_RATING_MAP.get(rating_str.lower())
+    if rating is None:
+        return None
+
+    executive_summary = _extract_section(text, "Executive Summary") or _body_text(text)
+    investment_thesis = _extract_section(text, "Investment Thesis") or ""
+
+    price_target = None
+    pt_str = _extract_section(text, "Price Target")
+    if pt_str:
+        fm = _FLOAT_RE.search(pt_str)
+        if fm:
+            price_target = float(fm.group(1))
+
+    time_horizon = _extract_section(text, "Time Horizon")
+
+    return PortfolioDecision(
+        rating=rating,
+        executive_summary=executive_summary,
+        investment_thesis=investment_thesis,
+        price_target=price_target,
+        time_horizon=time_horizon,
+    )
+
+
+def recover_sentiment_report(text: str) -> Optional[SentimentReport]:
+    """Heuristically reconstruct a SentimentReport from free-text prose."""
+    # Band: search for any known band value in the text
+    band = None
+    # Try longer names first to avoid "Bullish" matching before "Mildly Bullish"
+    for band_val in sorted(_SENTIMENT_BAND_MAP, key=len, reverse=True):
+        if band_val in text.lower():
+            band = _SENTIMENT_BAND_MAP[band_val]
+            break
+    if band is None:
+        return None
+
+    # Score
+    score = 5.0  # default neutral
+    m = _SCORE_RE.search(text)
+    if m:
+        score = min(10.0, max(0.0, float(m.group(1))))
+
+    # Confidence
+    confidence = "medium"
+    m = _CONFIDENCE_RE.search(text)
+    if m:
+        confidence = m.group(1).lower()
+
+    return SentimentReport(
+        overall_band=band,
+        overall_score=score,
+        confidence=confidence,
+        narrative=_body_text(text) or text.strip(),
+    )

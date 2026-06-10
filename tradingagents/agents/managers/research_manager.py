@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tradingagents.agents.schemas import ResearchPlan, render_research_plan
+from tradingagents.agents.schemas import ResearchPlan, render_research_plan, recover_research_plan
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
@@ -48,6 +48,8 @@ Commit to a clear stance whenever the debate's strongest arguments warrant one; 
             prompt,
             render_research_plan,
             "Research Manager",
+            schema=ResearchPlan,
+            recover=recover_research_plan,
         )
 
         new_investment_debate_state = {

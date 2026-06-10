@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from tradingagents.agents.schemas import SentimentReport, render_sentiment_report
+from tradingagents.agents.schemas import SentimentReport, render_sentiment_report, recover_sentiment_report
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
@@ -108,6 +108,8 @@ def create_sentiment_analyst(llm):
             formatted_messages,
             render_sentiment_report,
             "Sentiment Analyst",
+            schema=SentimentReport,
+            recover=recover_sentiment_report,
         )
 
         return {
